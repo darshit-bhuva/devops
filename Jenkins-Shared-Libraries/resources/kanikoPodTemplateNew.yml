@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kaniko
+spec:
+  nodeSelector:
+    jenkins: true
+  tolerations:
+  - effect: NoSchedule
+    key: jenkins
+    operator: Equal
+    value: true 
+  containers:
+  - name: jnlp
+    workingDir: /home/jenkins
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "384Mi"
+        cpu: "350m"
+  - name: kaniko
+    workingDir: /home/jenkins
+    image: public.ecr.aws/d5h017d0/kaniko:latest
+    imagePullPolicy: Always
+    resources:
+      requests:
+        memory: "1512Mi"
+        cpu: "400m"
+      limits:
+        memory: "7680Mi"
+        cpu: "1200m"
+    command:
+    - /busybox/cat
+    tty: true
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker/
+    - name: aws-secret
+      mountPath: /root/.aws/
+  - name: helm
+    image: public.ecr.aws/d5h017d0/gitlab-ci:latestv1
+    tty: true
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "1024Mi"
+        cpu: "750m"
+  - name: sonarqube
+    image: sonarsource/sonar-scanner-cli:4.7
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "1024Mi"
+        cpu: "750m"
+    command: ['/bin/bash']
+    tty: true
+  restartPolicy: Never
+  volumes:
+  - name: docker-config
+    configMap:
+      name: docker-config  
+  - name: aws-secret
+    secret:
+      secretName: aws-secret

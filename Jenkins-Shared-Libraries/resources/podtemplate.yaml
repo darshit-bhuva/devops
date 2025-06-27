@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+spec:
+  nodeSelector:
+    pv: jenkins
+  tolerations:
+  - effect: NoSchedule
+    key: pv
+    operator: Equal
+    value: jenkins
+  containers:
+  - name: docker
+    image: public.ecr.aws/d5h017d0/gitlab-ci:latestv2argocd
+    tty: true
+    volumeMounts:
+      - mountPath: /var/run/docker.sock
+        name: docker-sock
+  - name: sonarqube
+    image: sonarsource/sonar-scanner-cli:latest
+    command: ['/bin/bash']
+    tty: true
+    volumeMounts:
+      - mountPath: /var/run/docker.sock
+        name: docker-sock
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
