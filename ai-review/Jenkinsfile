@@ -1,0 +1,495 @@
+pipeline {
+    agent any
+
+    options {
+        gitLabConnection('Gitlab-test')
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    triggers {
+        gitlab(
+            triggerOnPush: false,
+            triggerOnMergeRequest: false,
+            triggerOnAcceptedMergeRequest: true,
+            branchFilterType: 'All'
+        )
+    }
+
+    environment {
+        GITLAB_URL = 'https://gitlab.fantasywl.in'
+        GITLAB_CREDENTIALS = 'darshit-gitlab'
+        SONAR_TOKEN = credentials('sonar-token-darshit')
+        SONAR_HOST_URL = 'https://sonar.fantasywl.in'
+        WEBHOOK_SERVICE_URL = 'https://9a2a-2409-40c1-17-6ff6-c766-8abd-3526-1229.ngrok-free.app'
+    }
+
+    stages {
+        stage('Extract Merge Event Details') {
+            steps {
+                script {
+                    env.REPO_NAME = env.PROJECT_PATH?.split('/')?.last() ?: 'unknown-repo'
+                    env.SOURCE_BRANCH = env.SOURCE_BRANCH ?: 'unknown-branch'
+                    env.DETAILED_MERGE_STATUS = env.DETAILED_MERGE_STATUS ?: 'unknown'
+                    env.SONAR_PROJECT_KEY = "${env.REPO_NAME}-${env.SOURCE_BRANCH}".toLowerCase()
+                    env.SONAR_PROJECT_NAME = "${env.REPO_NAME}-${env.SOURCE_BRANCH}"
+                    env.MR_IID = env.gitlabMergeRequestIid ?: env.MR_IID ?: 'unknown'
+
+                    echo """
+                    Webhook Payload Details:
+                    - Repository: ${env.REPO_NAME}
+                    - Branch: ${env.SOURCE_BRANCH}
+                    - Merge Status: ${env.DETAILED_MERGE_STATUS}
+                    - Merge Request IID: ${env.MR_IID}
+                    - SonarQube Project: ${env.SONAR_PROJECT_KEY}
+                    """
+                }
+            }
+        }
+
+        stage('Check Merge Status') {
+            steps {
+                script {
+                    if (env.DETAILED_MERGE_STATUS == 'not_open') {
+                        echo "MR is not open (status: ${env.DETAILED_MERGE_STATUS}), skipping analysis"
+                        currentBuild.result = 'NOT_BUILT'
+                        return
+                    }
+                }
+            }
+        }
+
+        stage('Checkout Source Branch') {
+            when {
+                expression { env.DETAILED_MERGE_STATUS != 'not_open' }
+            }
+            steps {
+                script {
+                    git(
+                        url: "${env.GITLAB_URL}/${env.PROJECT_PATH}.git",
+                        branch: env.SOURCE_BRANCH,
+                        credentialsId: env.GITLAB_CREDENTIALS
+                    )
+                }
+            }
+        }
+
+        stage('Manage SonarQube Project') {
+            when {
+                expression { env.DETAILED_MERGE_STATUS == 'checking' }
+            }
+            steps {
+                script {
+                    def response = sh(
+                        script: """
+                            curl -s -u ${SONAR_TOKEN}: \
+                            "${SONAR_HOST_URL}/api/projects/search?projects=${env.SONAR_PROJECT_KEY}"
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def projectExists = !response.contains('"components":[]')
+
+                    if (!projectExists) {
+                        echo "Creating new SonarQube project: ${env.SONAR_PROJECT_KEY}"
+                        sh """
+                            curl -s -u ${SONAR_TOKEN}: \
+                            -X POST "${SONAR_HOST_URL}/api/projects/create?name=${env.SONAR_PROJECT_NAME}&project=${env.SONAR_PROJECT_KEY}"
+                        """
+                    } else {
+                        echo "SonarQube project already exists: ${env.SONAR_PROJECT_KEY}"
+                    }
+                }
+            }
+        }
+        
+        stage('Cleanup SonarQube Project') {
+            when {
+                expression { env.DETAILED_MERGE_STATUS == 'not_open' }
+            }
+            steps {
+                script {
+                    echo "Attempting to delete SonarQube project: ${env.SONAR_PROJECT_KEY}"
+                    sh """
+                        curl -s -u ${SONAR_TOKEN}: \
+                        -X POST "${SONAR_HOST_URL}/api/projects/delete?project=${env.SONAR_PROJECT_KEY}" || echo "Project deletion failed or project didn't exist"
+                    """
+                }
+            }
+        }
+
+        stage('Sonarqube Analysis') {
+            when {
+                allOf {
+                    expression { env.DETAILED_MERGE_STATUS != 'not_open' }
+                    expression { currentBuild.result != 'NOT_BUILT' }
+                }
+            }
+            environment {
+                scannerHome = tool 'sonar-scanner'
+            }
+            steps {
+                withSonarQubeEnv('sonar') {
+                    script {
+                        // Capture the scanner output to extract task ID
+                        def scannerOutput = sh(
+                            script: """
+                                ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \
+                                -Dsonar.projectName=${env.SONAR_PROJECT_NAME} \
+                                -Dsonar.sources=. \
+                                -Dsonar.exclusions=**/node_modules/**
+                            """,
+                            returnStdout: true
+                        )
+                        
+                        // Extract and store the task ID from scanner output
+                        def taskIdMatch = scannerOutput =~ /task\?id=([^\s]+)/
+                        if (taskIdMatch) {
+                            env.SONAR_TASK_ID = taskIdMatch[0][1]
+                            echo "SonarQube Task ID: ${env.SONAR_TASK_ID}"
+                        } else {
+                            echo "Warning: Could not extract SonarQube task ID from output"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Get File-Specific Details') {
+    when {
+        allOf {
+            expression { env.DETAILED_MERGE_STATUS == 'checking' }
+            expression { currentBuild.result != 'FAILURE' }
+        }
+    }
+    steps {
+        withCredentials([string(credentialsId: 'sonar-token-darshit', variable: 'SONAR_AUTH_TOKEN')]) {
+            script {
+                def projectKey = env.SONAR_PROJECT_KEY
+                
+                echo "=== Getting File-Specific SonarQube Details ==="
+                
+                // 1. Get all files in the project
+                echo "Fetching project files..."
+                def filesResponse = sh(
+                    script: """
+                        curl -s -u "\${SONAR_AUTH_TOKEN}:" \
+                        "${env.SONAR_HOST_URL}/api/components/tree?component=${projectKey}&qualifiers=FIL&ps=500"
+                    """,
+                    returnStdout: true
+                ).trim()
+                
+                // Save files response for debugging
+                writeFile file: 'sonar-files.json', text: filesResponse
+                echo "Files response saved to sonar-files.json"
+                
+                // 2. Get detailed issues with file information
+                echo "Fetching detailed issues..."
+                def detailedIssuesResponse = sh(
+                    script: """
+                        curl -s -u "\${SONAR_AUTH_TOKEN}:" \
+                        "${env.SONAR_HOST_URL}/api/issues/search?componentKeys=${projectKey}&resolved=false&ps=500&additionalFields=comments,transitions"
+                    """,
+                    returnStdout: true
+                ).trim()
+                
+                writeFile file: 'sonar-detailed-issues.json', text: detailedIssuesResponse
+                echo "Detailed issues saved to sonar-detailed-issues.json"
+                
+                // 3. Get security hotspots with file details
+                echo "Fetching security hotspots..."
+                def hotspotsResponse = sh(
+                    script: """
+                        curl -s -u "\${SONAR_AUTH_TOKEN}:" \
+                        "${env.SONAR_HOST_URL}/api/hotspots/search?projectKey=${projectKey}&ps=500"
+                    """,
+                    returnStdout: true
+                ).trim()
+                
+                writeFile file: 'sonar-hotspots.json', text: hotspotsResponse
+                echo "Security hotspots saved to sonar-hotspots.json"
+                
+                // 4. Get measures for all files at once
+                echo "Fetching file measures..."
+                def fileMeasuresResponse = sh(
+                    script: """
+                        curl -s -u "\${SONAR_AUTH_TOKEN}:" \
+                        "${env.SONAR_HOST_URL}/api/measures/component_tree?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots,ncloc,complexity&qualifiers=FIL"
+                    """,
+                    returnStdout: true
+                ).trim()
+                
+                writeFile file: 'sonar-file-measures.json', text: fileMeasuresResponse
+                echo "File measures saved to sonar-file-measures.json"
+                
+                // 5. Create a simple text report
+                def reportContent = createSimpleFileReport(filesResponse, detailedIssuesResponse, hotspotsResponse, fileMeasuresResponse)
+                writeFile file: 'file-analysis-report.txt', text: reportContent
+                
+                echo "=== File Analysis Report ==="
+                echo reportContent
+                
+                // 6. Archive all the detailed files
+                archiveArtifacts artifacts: 'sonar-*.json,file-analysis-report.txt', fingerprint: true
+                
+                echo "All detailed files have been archived and are available for download"
+            }
+        }
+    }
+}
+
+        stage('Post Analysis to Webhook') {
+    when {
+        allOf {
+            expression { env.DETAILED_MERGE_STATUS == 'checking' }
+            expression { currentBuild.result != 'FAILURE' }
+        }
+    }
+    steps {
+        withCredentials([string(credentialsId: 'sonar-token-darshit', variable: 'SONAR_AUTH_TOKEN')]) {
+            script {
+                // Wait for analysis to be processed using the extracted task ID
+                if (env.SONAR_TASK_ID) {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitUntil {
+                            script {
+                                try {
+                                    def taskUrl = "${SONAR_HOST_URL}/api/ce/task?id=${env.SONAR_TASK_ID}"
+                                    def taskResponse = sh(
+                                        script: """
+                                            curl -s -u "\${SONAR_AUTH_TOKEN}:" '${taskUrl}'
+                                        """,
+                                        returnStdout: true
+                                    ).trim()
+                                    
+                                    echo "Task response: ${taskResponse}"
+                                    
+                                    // Parse JSON response without jq - look for "status":"SUCCESS"
+                                    def taskStatus = 'UNKNOWN'
+                                    if (taskResponse.contains('"status":"SUCCESS"')) {
+                                        taskStatus = 'SUCCESS'
+                                    } else if (taskResponse.contains('"status":"FAILED"')) {
+                                        taskStatus = 'FAILED'
+                                    } else if (taskResponse.contains('"status":"CANCELED"')) {
+                                        taskStatus = 'CANCELED'
+                                    } else if (taskResponse.contains('"status":"PENDING"') || taskResponse.contains('"status":"IN_PROGRESS"')) {
+                                        taskStatus = 'IN_PROGRESS'
+                                    }
+                                    
+                                    echo "Parsed task status: ${taskStatus}"
+                                    
+                                    if (taskStatus == 'FAILED' || taskStatus == 'CANCELED') {
+                                        error("SonarQube analysis failed with status: ${taskStatus}")
+                                    }
+                                    
+                                    return taskStatus == 'SUCCESS'
+                                } catch (Exception e) {
+                                    echo "Error checking task status: ${e.getMessage()}"
+                                    return false
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    echo "No task ID available, waiting 30 seconds for analysis completion..."
+                    sleep(time: 30, unit: 'SECONDS')
+                }
+
+                // Get comprehensive SonarQube data
+                def analysisData = getSonarQubeAnalysisData()
+
+                // Prepare the webhook payload
+                def webhookPayload = [
+                    project_key: env.SONAR_PROJECT_KEY,
+                    MR_IID: env.MR_IID,
+                    repository: env.PROJECT_PATH,
+                    branch: env.SOURCE_BRANCH,
+                    analysis_data: analysisData,
+                    build_url: env.BUILD_URL,
+                    timestamp: new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+                ]
+
+                // Convert payload to JSON and save to a temporary file
+                def jsonPayload = groovy.json.JsonOutput.toJson(webhookPayload)
+                writeFile file: 'webhook-payload.json', text: jsonPayload
+
+                // Post to webhook with retries
+                withRetry(maxRetries: 3, delay: 5) {
+                    def curlResponse = sh(
+                        script: """
+                            curl -s -X POST \
+                            -H "Content-Type: application/json" \
+                            --data @webhook-payload.json \
+                            "${env.WEBHOOK_SERVICE_URL}/sonarqube-webhook" \
+                            -w "%{http_code}" \
+                            -o curl_response.txt
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def responseBody = readFile('curl_response.txt').trim()
+                    echo "Webhook response body: ${responseBody}"
+                    echo "Webhook response code: ${curlResponse}"
+
+                    // Check if response code is in the 200-399 range (success)
+                    def statusCode = curlResponse as Integer
+                    if (statusCode < 200 || statusCode > 399) {
+                        error "Webhook request failed with status code: ${statusCode}"
+                    }
+                }
+            }
+        }
+    }
+}
+    }
+
+    post {
+        success {
+            updateGitlabCommitStatus name: 'SonarQube Analysis', state: 'success'
+            echo 'Analysis completed successfully'
+        }
+        failure {
+            updateGitlabCommitStatus name: 'SonarQube Analysis', state: 'failed'
+            echo 'Analysis failed'
+        }
+        aborted {
+            updateGitlabCommitStatus name: 'SonarQube Analysis', state: 'canceled'
+            echo 'Analysis canceled'
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Helper function to get SonarQube analysis data
+def getSonarQubeAnalysisData() {
+    return withCredentials([string(credentialsId: 'sonar-token-darshit', variable: 'SONAR_AUTH_TOKEN')]) {
+        def projectKey = env.SONAR_PROJECT_KEY
+        
+        def analysisUrl = "${env.SONAR_HOST_URL}/api/project_analyses/search?project=${projectKey}"
+        def issuesUrl = "${env.SONAR_HOST_URL}/api/issues/search?componentKeys=${projectKey}&resolved=false&ps=500"
+        def measuresUrl = "${env.SONAR_HOST_URL}/api/measures/component?component=${projectKey}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,security_hotspots"
+        def qualityGateUrl = "${env.SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${projectKey}"
+
+        try {
+            def analysisResponse = sh(
+                script: "curl -s -u \"\${SONAR_AUTH_TOKEN}:\" '${analysisUrl}'",
+                returnStdout: true
+            ).trim()
+            
+            def issuesResponse = sh(
+                script: "curl -s -u \"\${SONAR_AUTH_TOKEN}:\" '${issuesUrl}'",
+                returnStdout: true
+            ).trim()
+            
+            def measuresResponse = sh(
+                script: "curl -s -u \"\${SONAR_AUTH_TOKEN}:\" '${measuresUrl}'",
+                returnStdout: true
+            ).trim()
+            
+            def qualityGateResponse = sh(
+                script: "curl -s -u \"\${SONAR_AUTH_TOKEN}:\" '${qualityGateUrl}'",
+                returnStdout: true
+            ).trim()
+
+            return [
+                analysis: analysisResponse,
+                issues: issuesResponse,
+                measures: measuresResponse,
+                quality_gate: qualityGateResponse
+            ]
+        } catch (Exception e) {
+            echo "Error fetching SonarQube data: ${e.getMessage()}"
+            return [
+                error: "Failed to fetch SonarQube data: ${e.getMessage()}"
+            ]
+        }
+    }
+}
+
+// Retry utility
+def withRetry(Map args = [:], Closure body) {
+    def maxRetries = args.maxRetries ?: 3
+    def delay = args.delay ?: 5
+    def retryCount = 0
+    
+    while (retryCount < maxRetries) {
+        try {
+            return body()
+        } catch (Exception e) {
+            retryCount++
+            echo "Attempt ${retryCount} failed: ${e.getMessage()}"
+            if (retryCount >= maxRetries) {
+                throw e
+            }
+            sleep(time: delay, unit: 'SECONDS')
+        }
+    }
+}
+
+// Simple function to create a readable report
+def createSimpleFileReport(filesResponse, issuesResponse, hotspotsResponse, measuresResponse) {
+    def report = new StringBuilder()
+    
+    report.append("=== SonarQube File Analysis Report ===\n")
+    report.append("Project: ${env.SONAR_PROJECT_KEY}\n")
+    report.append("Branch: ${env.SOURCE_BRANCH}\n")
+    report.append("Generated: ${new Date().format('yyyy-MM-dd HH:mm:ss')}\n\n")
+    
+    // Extract file names from issues and hotspots
+    def issueFiles = []
+    def hotspotFiles = []
+    
+    // Simple extraction using string matching
+    def issueMatches = issuesResponse =~ /"component":"([^"]+)"/
+    issueMatches.each { match ->
+        def componentKey = match[1]
+        def fileName = componentKey.split(':').last()
+        if (!issueFiles.contains(fileName)) {
+            issueFiles.add(fileName)
+        }
+    }
+    
+    def hotspotMatches = hotspotsResponse =~ /"component":"([^"]+)"/
+    hotspotMatches.each { match ->
+        def componentKey = match[1]
+        def fileName = componentKey.split(':').last()
+        if (!hotspotFiles.contains(fileName)) {
+            hotspotFiles.add(fileName)
+        }
+    }
+    
+    report.append("=== Summary ===\n")
+    report.append("Files with Issues: ${issueFiles.size()}\n")
+    report.append("Files with Security Hotspots: ${hotspotFiles.size()}\n\n")
+    
+    if (issueFiles.size() > 0) {
+        report.append("=== Files with Issues ===\n")
+        issueFiles.each { fileName ->
+            report.append("- ${fileName}\n")
+        }
+        report.append("\n")
+    }
+    
+    if (hotspotFiles.size() > 0) {
+        report.append("=== Files with Security Hotspots ===\n")
+        hotspotFiles.each { fileName ->
+            report.append("- ${fileName}\n")
+        }
+        report.append("\n")
+    }
+    
+    report.append("=== Raw Data Files ===\n")
+    report.append("- sonar-files.json: Complete list of all analyzed files\n")
+    report.append("- sonar-detailed-issues.json: Detailed issues with line numbers and descriptions\n")
+    report.append("- sonar-hotspots.json: Security hotspots with vulnerability details\n")
+    report.append("- sonar-file-measures.json: Metrics for each individual file\n\n")
+    
+    report.append("=== Next Steps ===\n")
+    report.append("1. Download the archived JSON files for detailed analysis\n")
+    report.append("2. Review issues in the listed files\n")
+    report.append("3. Address security hotspots in the identified files\n")
+    
+    return report.toString()
+}
