@@ -1,0 +1,75 @@
+replicaCount: 2
+
+image: 543567658769.dkr.ecr.ap-south-1.amazonaws.com/project-node-backend-dev:latest
+
+namespace: dev
+
+labels:
+  tier: backend
+  release: blue-green
+
+podlabels:
+  verison: 1.0.0
+  
+service:
+  type: NodePort
+  port: 1338
+  healthcheck: /health-check
+  pm2: 9209
+  internaltype: ClusterIP
+  internalport: 80
+  grpcport: 1339
+
+vsservice:
+  vscode: 8080
+
+# resources:
+#   requests:
+#     memory: "200Mi"
+#     cpu: "50m"
+#   limits:
+#     memory: "500Mi"
+#     cpu: "350m"
+
+resources:
+  requests:
+    memory: "100Mi"
+    cpu: "50m"
+  limits:
+    memory: "600Mi"
+    cpu: "900m"
+
+livenessProbe:
+   periodSeconds: 10
+   successThreshold: 1
+   failureThreshold: 3
+   initialDelaySeconds: 5
+   timeoutSeconds: 30
+readinessProbe:
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 3
+  initialDelaySeconds: 5
+  timeoutSeconds: 30
+
+autoscaling:
+  enabled: true
+  minReplicas: "2"
+  maxReplicas: "3"
+  targetCPU: "60"
+    # targetMemory: ""
+
+disruption:
+  enabled: true
+  minAvailable: 1
+
+#Because we are using our private docker registry deployed in Kubernetes if you are using AWS(ECR) than you can disable this.
+imagePullSecrets:
+  enabled: true
+  name: regcred
+
+podprestophook:
+  enabled: true
+
+job:
+  enabled: false

@@ -1,0 +1,309 @@
+def notifyProductionDeploy() {
+    def icons = [":unicorn_face:", ":beer:", ":bee:", ":man_dancing:",
+        ":confetti_ball:", ":ghost:", ":dancer:", ":scream_cat:"]
+    def randomIndex = (new Random()).nextInt(icons.size())
+    def message = "Build for ${env.JOB_NAME} <${env.BUILD_URL}|${currentBuild.displayName}> " +
+        "is ${currentBuild.currentResult} ${icons[randomIndex]}"
+    return message
+}
+
+def buildNumber = BUILD_NUMBER as int; // Get the build number as an integer
+if (buildNumber > 1) milestone(buildNumber - 1); // Trigger milestone for the previous build number
+milestone(buildNumber); // Trigger milestone for the current build number
+
+@Library('mySharedLibrary@main') _ // Importing a shared library named 'mySharedLibrary'
+
+pipeline {
+  options {
+      timeout(time: 1, unit: 'HOURS')
+  }
+  agent {
+    kubernetes {
+      yaml libraryResource('kanikoPodTemplate.yml') // Use a Kubernetes pod template defined in a library resource...
+    }
+  }
+  environment {
+    JIRA_SITE = '' // Jira site URL
+    JIRA_JENKINS_URL = "${BASE_URL}${env.JOB_NAME.replace(' ', '%20')}/${env.BUILD_NUMBER}/" // Construct the correct Jenkins URL
+    BUILD_NAME = "$PROJECT_NAME" + "-node-backend" // Set the build name based on the project name
+    CI_COMMIT_SHA = "$GIT_BRANCH" + "_$GIT_COMMIT" // Set the commit SHA based on the branch and commit
+    GIT_COMMIT_EMAIL = sh (script: 'git --no-pager show -s --format=\'%ae\'',returnStdout: true).trim() // Set the commit email based on the committer's email
+    GIT_COMMIT_MSG = sh (script: 'git log -1 --pretty=%B ${GIT_COMMIT}', returnStdout: true).trim() // Get the last commit message
+    FW_MAIL_TO = "$FW_MAIL_TO"
+    FW_MAIL_TO_TL = "$FW_MAIL_TO_TL"
+  }
+  stages {
+        stage('Validate Commit Message') {
+            steps {
+                script {
+                    // Match any FWB-XXX format in the commit message
+                    def jiraPattern = /FWB-\d+/ // Matches "FWB-123"
+                    def jiraTicketMatch = (env.GIT_COMMIT_MSG =~ jiraPattern)
+
+                    if (jiraTicketMatch) {
+                        def jiraTicket = jiraTicketMatch[0]
+                        env.JIRA_TICKET = jiraTicket // Save the first matching JIRA ticket to the environment
+                        echo "JIRA Ticket Validated: ${jiraTicket}"          
+                    } else {
+                        echo "No valid JIRA ticket found in the commit message. Proceeding with the pipeline."
+                    }
+                }
+            }
+        }
+    stage("Build Docker images") {
+		when {
+			anyOf {
+					branch 'dev'
+					branch 'staging'
+			}
+// 			not { changeset 'devops/**' } //This will skip the build step if any changes in devops folder
+		}
+		environment{
+			BUILD = "$BUILD_NAME" + "-$GIT_BRANCH" // Set the build name for new deployment
+			dockerfile = "Dockerfile" // Set the Dockerfile for npm cache
+			project = "eks-cluster" // Set the project name
+			ECR_URL = "$FW_ECR_URL" //Set the ECR URL 
+		}
+			steps {
+				script {
+					stage("ExampleProject Node-backend ${GIT_BRANCH} Build") {
+						container(name: 'kaniko', shell: '/busybox/sh') {
+							withCredentials([[
+									$class: 'AmazonWebServicesCredentialsBinding',credentialsId: "${env.FW_AWS_CREDS}",accessKeyVariable: 'AWS_ACCESS_KEY_ID',secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],usernamePassword(credentialsId: "${env.GIT_CREDS}", usernameVariable: 'gitUser', passwordVariable: 'gitPass')]) {
+									script {
+                    								sh "aws s3 cp s3://ExampleProject-firebase-sdk/ExampleProject-dev-sdk/firebase-sdk.json ./helper/third-party-cred/"
+										build('${GIT_BRANCH}', '$dockerfile', '$project') // Execute npm cache for the project
+										}
+									}
+							}
+						}
+						if (GIT_BRANCH == 'dev') {
+							stage("Sonarqube Scanning") {
+									container('sonarqube') {
+											sh 'sonar-scanner'
+									}
+							}
+           	}
+				}
+			}
+                                    post {
+                success {
+                    script {
+                        jiraSendBuildInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentName: "Build for $GIT_BRANCH",
+                            description: "Build succeeded for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                            state: "successful",
+                            buildUrl: "${JIRA_JENKINS_URL}"
+                        )
+                    }
+                }
+                failure {
+                    script {
+                        jiraSendBuildInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentName: "Build for $GIT_BRANCH",
+                            description: "Build failed for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                            state: "failed",
+                            buildUrl: "${JIRA_JENKINS_URL}"
+                        )
+                    }
+                }
+            }
+    }
+		stage("ExampleProject Node-backend Production Build") {
+                when {
+                        beforeInput true
+                        branch 'master'
+                        //not { changeset 'devops/**' } //This will skip the build step if any changes in devops folder
+                }
+        //         options {
+        //         timeout(time: 1, unit: 'DAYS')
+        //       }
+              input {
+                message "Should we continue for Production?"
+                ok "Yes, we should."
+              }
+                environment{
+                        BUILD = "$BUILD_NAME" + "-$GIT_BRANCH" // Set the build name for new deployment
+                        dockerfile = "Dockerfile" // Set the Dockerfile for npm cache
+                        project = "eks-custer" // Set the project name
+                        ECR_URL = "$FW_ECR_URL" //Set the ECR URL
+                }
+                        steps {
+                                                container(name: 'kaniko', shell: '/busybox/sh') {
+                                                        withCredentials([[
+                                                                        $class: 'AmazonWebServicesCredentialsBinding',credentialsId: "${env.FW_AWS_CREDS}",accessKeyVariable: 'AWS_ACCESS_KEY_ID',secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],usernamePassword(credentialsId: "${env.GIT_CREDS}", usernameVariable: 'gitUser', passwordVariable: 'gitPass')]) {
+                                                                        script {
+										sh "aws s3 cp s3://ExampleProject-firebase-sdk/ExampleProject-dev-sdk/firebase-sdk.json ./helper/third-party-cred/"
+                                                                                build('${GIT_BRANCH}', '$dockerfile', '$project') // Execute npm cache for the project
+                                                                                }
+                                                        }
+                                        }
+                        }
+                                    post {
+                success {
+                    script {
+                        jiraSendBuildInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentName: "Build for $GIT_BRANCH",
+                            description: "Build succeeded for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                            state: "successful",
+                            buildUrl: "${JIRA_JENKINS_URL}"
+                        )
+                    }
+                }
+                failure {
+                    script {
+                        jiraSendBuildInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentName: "Build for $GIT_BRANCH",
+                            description: "Build failed for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                            state: "failed",
+                            buildUrl: "${JIRA_JENKINS_URL}"
+                        )
+                    }
+                }
+            }
+    }
+
+  	stage('Deploying....') {
+		  when {
+                        anyOf {
+                                        branch 'dev'
+                                        branch 'staging'
+                        }
+                }                
+			environment{
+				namespace = "$GIT_BRANCH" // Sets the deployment namespace
+				project = "eks-custer" // Sets the project name
+			}
+			steps {
+				script {
+					stage("ExampleProject Node-backend ${GIT_BRANCH} Deploy") {
+					// This stage deploys the project
+						container('helm') { // Runs the steps within a Docker container
+						withCredentials([[
+							$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],usernamePassword(credentialsId: "${env.GIT_CREDS}", usernameVariable: 'gitUser', passwordVariable: 'gitPass')]) {
+									awsConfigure('$AWS_ACCESS_KEY_ID','$AWS_SECRET_ACCESS_KEY','$FW_REGION','$project')
+									helmGenerate('${GIT_BRANCH}')
+									deploy('${GIT_BRANCH}','$namespace')
+							}
+						}
+					}
+				}
+			}
+                                    post {
+                success {
+                    script {
+                        jiraSendDeploymentInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentId: "$GIT_BRANCH",
+                            environmentName: "$GIT_BRANCH",
+                            environmentType: "staging", // Use a valid value
+                            deploymentInfo: [
+                                key: "${env.JIRA_TICKET}-Deployment",
+                                name: "Deploy to $GIT_BRANCH",
+                                description: "Deployment succeeded for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                                state: "successful",
+                                url: "${JIRA_JENKINS_URL}"
+                            ]
+                        )
+                    }
+                }
+                failure {
+                    script {
+                        jiraSendDeploymentInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentId: "$GIT_BRANCH",
+                            environmentName: "$GIT_BRANCH",
+                            environmentType: "staging", // Use a valid value
+                            deploymentInfo: [
+                                key: "${env.JIRA_TICKET}-Deployment",
+                                name: "Deploy to $GIT_BRANCH",
+                                description: "Deployment failed for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                                state: "failed",
+                                url: "${JIRA_JENKINS_URL}"
+                            ]
+                        )
+                    }
+                }
+            }
+  	}
+        stage('ExampleProject Node-backend Production Deploy') {
+                when {
+                        branch 'master'
+                }                
+                        environment{
+                                namespace = "production" // Sets the deployment namespace
+                                project = "eks-custer" // Sets the project name
+                        }
+                        steps {
+                                        // This stage deploys the project
+                                                container('helm') { // Runs the steps within a Docker container
+                                                withCredentials([[
+                                                        $class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${env.FW_AWS_CREDS}", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'],usernamePassword(credentialsId: "${env.GIT_CREDS}", usernameVariable: 'gitUser', passwordVariable: 'gitPass')]) {
+                                                                        awsConfigure('$AWS_ACCESS_KEY_ID','$AWS_SECRET_ACCESS_KEY','$FW_REGION','$project')
+                                                                        helmGenerate('${GIT_BRANCH}')
+                                                                        deploy('${GIT_BRANCH}','$namespace')
+                                                        }
+                                }
+                        }
+                                    post {
+                success {
+                    script {
+                        jiraSendDeploymentInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentId: "$GIT_BRANCH",
+                            environmentName: "$GIT_BRANCH",
+                            environmentType: "staging", // Use a valid value
+                            deploymentInfo: [
+                                key: "${env.JIRA_TICKET}-Deployment",
+                                name: "Deploy to $GIT_BRANCH",
+                                description: "Deployment succeeded for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                                state: "successful",
+                                url: "${JIRA_JENKINS_URL}"
+                            ]
+                        )
+                    }
+                }
+                failure {
+                    script {
+                        jiraSendDeploymentInfo(
+                            site: 'Organization-ExampleProject-wl.atlassian.net',
+                            environmentId: "$GIT_BRANCH",
+                            environmentName: "$GIT_BRANCH",
+                            environmentType: "staging", // Use a valid value
+                            deploymentInfo: [
+                                key: "${env.JIRA_TICKET}-Deployment",
+                                name: "Deploy to $GIT_BRANCH",
+                                description: "Deployment failed for ${env.JIRA_TICKET} on $GIT_BRANCH branch.",
+                                state: "failed",
+                                url: "${JIRA_JENKINS_URL}"
+                            ]
+                        )
+                    }
+                }
+            }
+          }
+        }
+  post{
+		always{
+			script {
+					def userId = slackUserIdFromEmail("${GIT_COMMIT_EMAIL}")
+					def slackMessage = notifyProductionDeploy()
+					slackSend(channel: '#jenkins-alerts', color: 'good', message: "<@$userId> ${slackMessage}")
+			}                        
+				mail to: "${GIT_COMMIT_EMAIL}",
+				subject: "Your Pipeline Status For ${JOB_NAME}",
+				body: "Jenkins Build For Job ${env.JOB_NAME} is ${currentBuild.currentResult}:, You can Find More Info. at ${env.BUILD_URL}"
+			script {
+				if (currentBuild.currentResult != 'SUCCESS') {
+					mail to: "${FW_MAIL_TO}",cc: "${FW_MAIL_TO_TL}",
+						 subject: "Your Pipeline Status For ${JOB_NAME}",
+						 body: "Jenkins Build For Job ${env.JOB_NAME} is ${currentBuild.currentResult}:, You can Find More Info. at ${env.BUILD_URL}"
+				}
+			}				
+			}		
+    }
+}

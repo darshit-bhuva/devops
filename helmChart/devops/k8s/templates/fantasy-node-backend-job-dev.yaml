@@ -1,0 +1,45 @@
+{{- if .Values.job.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 5
+  completions: 1
+  template:
+    metadata:
+      name: {{ .Release.Name }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: {{ .Release.Name }}
+        image: {{ .Values.image }}
+        command: ["sh", "-c", "npm i -g sequelize-cli && npm run migration"]
+        env:
+        - name: DB_SQL_HOST
+          valueFrom:  
+            configMapKeyRef:
+              name: {{ .Release.Name }}
+              key: DB_SQL_HOST
+        - name: DB_SQL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: {{ .Release.Name }}
+              key: DB_SQL_NAME
+        - name: DB_SQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql
+              key: DB_SQL_PASSWORD
+        # - name: DB_SQL_DIALECT
+        #   valueFrom:
+        #     configMapKeyRef:
+        #       name: {{ .Release.Name }}
+        #       key: DB_SQL_DIALECT
+{{- end }}        

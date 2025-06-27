@@ -1,0 +1,36 @@
+# Base image: Likely an Alpine Linux-based Node.js image
+FROM node:20.10.0-alpine
+
+# Set environment variables
+ENV NODE_VERSION=20.10.0
+ENV YARN_VERSION=1.22.19
+ENV PHANTOMJS_VERSION=2.1.1
+ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/node/.npm-global/bin
+
+# Add non-root user and group
+RUN addgroup -g 1000 node && adduser -u 1000 -G node -s /bin/sh -D node
+
+# Install build dependencies
+RUN apk add --no-cache --virtual .build-deps \
+    build-base \
+    && apk add --no-cache \
+    curl \
+    && curl -o- -L https://yarnpkg.com/install.sh | sh -s -- --version ${YARN_VERSION}
+
+# Copy custom entrypoint script
+COPY docker-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+# Install PhantomJS and other dependencies
+RUN apk update && apk add --no-cache \
+    fontconfig \
+    freetype \
+    ttf-freefont \
+    && curl -Ls https://github.com/Medium/phantomjs/releases/download/v${PHANTOMJS_VERSION}/phantomjs-${PHANTOMJS_VERSION}-linux-x86_64.tar.bz2 | tar xj -C /usr/local/bin --strip-components=1 phantomjs-${PHANTOMJS_VERSION}-linux-x86_64/bin/phantomjs
+
+# Install pm2 and pm2-metrics
+RUN pm2 install pm2-metrics
+
+# Set default command
+CMD ["node"]

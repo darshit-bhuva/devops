@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: {{ .Values.namespace }}
+  name: {{ .Release.Name }}
+  labels:
+    tier: {{ .Values.labels.tier }}
+    app: {{ .Release.Name }}
+    release: {{ .Values.labels.release }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 50%
+  template:
+    metadata:
+      annotations:
+        configmap.reloader.stakater.com/reload: {{ .Release.Name }}
+        secret.reloader.stakater.com/reload: "apikeys,mysql,jwt,smtp,aws-secrets,cashfree,mongodb,keycloak"
+      labels:
+        app: {{ .Release.Name }}
+        version: {{ .Values.podlabels.version }}
+    spec:
+      {{- if .Values.imagePullSecrets.enabled }} 
+      imagePullSecrets:
+      - name: {{ .Values.imagePullSecrets.name }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: {{ .Release.Name }}
+            topologyKey: node-type
+        nodeAffinity: {{ .Values.nodeAffinity | toYaml | nindent 10 }}
+      tolerations: {{ .Values.tolerations | toYaml | nindent 8 }}
+      containers:
+      - name: {{ .Release.Name }}
+        image: {{ .Values.image }}
+        imagePullPolicy: Always
+        {{- if .Values.podprestophook.enabled }} 
+        lifecycle:
+          preStop:
+            exec:
+              command: ['sh', '-c', 'sleep 120']
+        {{- end }}
+        resources:
+          requests:
+            memory: {{ .Values.resources.requests.memory }}
+            cpu: {{ .Values.resources.requests.cpu }}
+          limits:
+            memory: {{ .Values.resources.limits.memory }}
+            cpu: {{ .Values.resources.limits.cpu }}
+        ports:
+        - containerPort: {{ .Values.service.port }}
+        - containerPort: {{ .Values.service.grpcport }}
+        livenessProbe:
+          httpGet:
+            path: {{ .Values.service.healthcheck }}
+            port: {{ .Values.service.port }}
+            scheme: HTTP
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          successThreshold: {{ .Values.livenessProbe.successThreshold }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+          timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.service.healthcheck }}
+            port: {{ .Values.service.port }}
+            scheme: HTTP
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          successThreshold: {{ .Values.readinessProbe.successThreshold }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+          timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+        
+        envFrom:
+        - secretRef:
+            name: apikeys
+        - secretRef:
+            name: cashfree
+        - secretRef:
+            name: mysql
+        - secretRef:
+            name: jwt
+        - secretRef:
+            name: aws-secrets
+        - secretRef:
+            name: smtp
+        - secretRef:
+            name: mongodb
+        - secretRef:
+            name: keycloak
+        - configMapRef:
+            name: {{ .Release.Name }}
